@@ -232,7 +232,10 @@ interface Operation {
 
 class Parser {
   private pos = 0;
-  constructor(private readonly tokens: Token[]) {}
+  private readonly tokens: Token[];
+  constructor(tokens: Token[]) {
+    this.tokens = tokens;
+  }
 
   private peek(): Token | undefined {
     return this.tokens[this.pos];
@@ -474,7 +477,10 @@ function issueFromCursor(cursor: string): number | null {
 }
 
 export class GraphQLExecutor {
-  constructor(private readonly store: Store) {}
+  private readonly store: Store;
+  constructor(store: Store) {
+    this.store = store;
+  }
 
   executeOperation(query: string, variables: Record<string, unknown>, operationName?: string): { data: unknown; errors: { message: string }[] } {
     const errors: { message: string }[] = [];
