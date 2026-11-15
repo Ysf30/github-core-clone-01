@@ -85,19 +85,11 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
-function pathOf(req: IncomingMessage): string {
+function urlOf(req: IncomingMessage): URL {
   try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
+    return new URL(req.url ?? '/', 'http://entry');
   } catch {
-    return '/';
-  }
-}
-
-function queryOf(req: IncomingMessage): URLSearchParams {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
-  } catch {
-    return new URLSearchParams();
+    return new URL('/', 'http://entry');
   }
 }
 
@@ -161,9 +153,6 @@ function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
     user: { login: VIEWER.login, id: VIEWER.id, type: 'User' },
     created_at: issue.createdAt,
     updated_at: issue.updatedAt,
-    html_url: `https://github.com/${repo.owner}/${repo.name}/issues/${issue.number}`,
-    url: `/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`,
-    comments: (repo.comments.get(issue.number) ?? []).length,
   };
 }
 
@@ -229,7 +218,9 @@ export function createApp(): Server {
 }
 
 async function handleRequest(store: Store, req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const path = pathOf(req);
+  const url = urlOf(req);
+  const path = url.pathname;
+  const query = url.searchParams;
   const method = req.method ?? 'GET';
   const segments = path.split('/').filter((segment) => segment !== '');
 
@@ -241,7 +232,7 @@ async function handleRequest(store: Store, req: IncomingMessage, res: ServerResp
 
   // Git smart HTTP: /{owner}/{repo}.git/...
   if (segments.length >= 2 && segments[1].endsWith('.git')) {
-    await handleGit(store, req, res, method, segments);
+    await handleGit(store, req, res, method, segments, query);
     return;
   }
 
@@ -294,7 +285,7 @@ async function handleRequest(store: Store, req: IncomingMessage, res: ServerResp
 
   // REST v3.
   if (segments[0] === 'api' && segments[1] === 'v3') {
-    await handleRest(store, req, res, method, segments, path);
+    await handleRest(store, req, res, method, segments, path, query);
     return;
   }
 
@@ -305,7 +296,7 @@ async function handleRequest(store: Store, req: IncomingMessage, res: ServerResp
 // ---------------------------------------------------------------------------------------------
 // git smart HTTP
 
-async function handleGit(store: Store, req: IncomingMessage, res: ServerResponse, method: string, segments: string[]): Promise<void> {
+async function handleGit(store: Store, req: IncomingMessage, res: ServerResponse, method: string, segments: string[], query: URLSearchParams): Promise<void> {
   const owner = decodeSegment(segments[0]);
   const repoName = decodeSegment(segments[1].slice(0, -'.git'.length));
   const rest = segments.slice(2);
@@ -324,7 +315,6 @@ async function handleGit(store: Store, req: IncomingMessage, res: ServerResponse
   }
 
   if (method === 'GET' && rest.length === 2 && rest[0] === 'info' && rest[1] === 'refs') {
-    const query = queryOf(req);
     const service = query.get('service');
     if (service === 'git-upload-pack' || service === 'git-receive-pack') {
       const isV2 = (req.headers['git-protocol'] ?? '') === 'version=2';
@@ -405,7 +395,7 @@ async function handleGit(store: Store, req: IncomingMessage, res: ServerResponse
 // ---------------------------------------------------------------------------------------------
 // REST v3
 
-async function handleRest(store: Store, req: IncomingMessage, res: ServerResponse, method: string, segments: string[], path: string): Promise<void> {
+async function handleRest(store: Store, req: IncomingMessage, res: ServerResponse, method: string, segments: string[], path: string, query: URLSearchParams): Promise<void> {
   // GET /api/v3/ — the API root, public (as api.github.com answers it).
   if ((path === '/api/v3' || path === '/api/v3/') && method === 'GET') {
     sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
@@ -416,7 +406,6 @@ async function handleRest(store: Store, req: IncomingMessage, res: ServerRespons
     return;
   }
 
-  const query = queryOf(req);
   const rest = segments.slice(2); // after 'api', 'v3'
 
   // Read and parse a JSON body when one is present (POST/PUT/PATCH/DELETE).
