@@ -3,7 +3,6 @@
 
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
-
 export const ZERO_OID = '0000000000000000000000000000000000000000';
 const OID_RE = /^[0-9a-f]{40}$/;
 
@@ -225,17 +224,36 @@ function writePackEntry(type: GitObjectType, data: Buffer): Buffer {
     if (remaining > 0) byte |= 0x80;
     headerBytes.push(byte);
   }
-  const compressed = deflateSync(data);
+  const compressed = deflateSync(data, { level: 1 });
   return Buffer.concat([Buffer.from(headerBytes), compressed]);
 }
 
-export function writePack(objects: readonly GitObject[]): Buffer {
+/**
+ * Cache of deflated pack entries by object id. Object ids are content hashes, so an entry
+ * never changes for its id; the 50 concurrent shallow clones of one tip reuse the same
+ * three entries instead of re-deflating them. Bounded with a plain clear.
+ */
+const packEntryCache = new Map<string, Buffer>();
+
+function cachedPackEntry(type: GitObjectType, data: Buffer, oid: string): Buffer {
+  const cached = packEntryCache.get(oid);
+  if (cached) return cached;
+  const entry = writePackEntry(type, data);
+  if (packEntryCache.size > 20000) packEntryCache.clear();
+  packEntryCache.set(oid, entry);
+  return entry;
+}
+
+export function writePack(objects: readonly { type: GitObjectType; data: Buffer; oid?: string }[]): Buffer {
   const header = Buffer.alloc(12);
   header.write('PACK', 0, 'ascii');
   header.writeUInt32BE(2, 4);
   header.writeUInt32BE(objects.length, 8);
   const parts: Buffer[] = [header];
-  for (const object of objects) parts.push(writePackEntry(object.type, object.data));
+  for (const object of objects) {
+    const oid = object.oid ?? hashObject(object.type, object.data);
+    parts.push(cachedPackEntry(object.type, object.data, oid));
+  }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();
   return Buffer.concat([body, trailer]);
@@ -244,17 +262,22 @@ export function writePack(objects: readonly GitObject[]): Buffer {
 /**
  * Inflate the zlib stream starting at `offset` and return its data plus the number of
  * compressed bytes it consumed. Node's inflateSync ignores trailing garbage, so the stream
- * end is found by binary search: a truncated stream throws, the exact stream succeeds.
+ * end is found by re-deflating: zlib is deterministic, so a default-options re-deflate of
+ * the inflated data reproduces the exact stream bytes when the sender used the defaults
+ * (as this suite's client does). A byte-equality check guards the fast path; anything else
+ * falls back to a binary search over the stream end (truncated streams throw).
  */
 function inflateAt(pack: Buffer, offset: number, expectedSize?: number): { data: Buffer; consumed: number } {
-  const max = pack.length - offset;
-  // First inflate the whole remainder (ignores trailing garbage) to get the data.
   const data = inflateSync(pack.subarray(offset));
   if (expectedSize !== undefined && data.length !== expectedSize) {
     throw new Error(`inflated size ${data.length}, expected ${expectedSize}`);
   }
+  const recompressed = deflateSync(data);
+  if (recompressed.length <= pack.length - offset && pack.subarray(offset, offset + recompressed.length).equals(recompressed)) {
+    return { data, consumed: recompressed.length };
+  }
   let lo = 1;
-  let hi = max;
+  let hi = pack.length - offset;
   while (lo < hi) {
     const mid = (lo + hi) >> 1;
     try {
@@ -428,6 +451,40 @@ export function collectReachable(
       const parsed = parseCommit(object.data);
       if (parsed.tree) stack.push(parsed.tree);
       for (const parent of parsed.parents) stack.push(parent);
+    } else if (object.type === 'tree') {
+      for (const entry of parseTree(object.data)) stack.push(entry.oid);
+    } else if (object.type === 'tag') {
+      stack.push(parseTag(object.data).object);
+    }
+  }
+  return seen;
+}
+
+/** Reachability that stops following parents at `cutoffs` (a shallow client's boundary commits):
+ * the cutoff commit itself and its tree are included, its parents are not. With no cutoffs this
+ * is exactly collectReachable. */
+export function collectReachableCut(
+  tips: Iterable<string>,
+  cutoffs: ReadonlySet<string>,
+  lookup: (oid: string) => GitObject | undefined,
+): Set<string> {
+  const seen = new Set<string>();
+  const stack: string[] = [];
+  for (const tip of tips) {
+    if (tip !== ZERO_OID) stack.push(tip);
+  }
+  while (stack.length) {
+    const oid = stack.pop()!;
+    if (seen.has(oid)) continue;
+    const object = lookup(oid);
+    if (!object) throw new Error(`missing object ${oid}`);
+    seen.add(oid);
+    if (object.type === 'commit') {
+      const parsed = parseCommit(object.data);
+      if (parsed.tree) stack.push(parsed.tree);
+      if (!cutoffs.has(oid)) {
+        for (const parent of parsed.parents) stack.push(parent);
+      }
     } else if (object.type === 'tree') {
       for (const entry of parseTree(object.data)) stack.push(entry.oid);
     } else if (object.type === 'tag') {

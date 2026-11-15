@@ -6,6 +6,7 @@ import {
   PKT_FLUSH,
   ZERO_OID,
   collectReachable,
+  collectReachableCut,
   decodePktLines,
   isAncestor,
   isObjectId,
@@ -14,7 +15,7 @@ import {
   readPack,
   shallowObjectSet,
   writePack,
-  type GitObject,
+  type GitObjectType,
 } from './gitcore.ts';
 import { Store, type Repo } from './store.ts';
 
@@ -126,32 +127,34 @@ export interface FetchArgs {
 }
 
 export interface FetchResult {
-  objects: GitObject[];
+  objects: { type: GitObjectType; data: Buffer; oid: string }[];
   shallow: string[];
   unshallow: string[];
 }
 
 export function computeFetch(store: Store, repo: Repo, args: FetchArgs): FetchResult {
   const lookup = store.lookup(repo);
+  // A shallow client's haves are cut at its boundary: exclude only what it actually holds.
+  const cutoffs = new Set(args.shallowBoundaries);
   let objectIds: Set<string>;
   let shallow: string[] = [];
   let unshallow: string[] = [];
   if (args.depth !== null) {
     const { objects, boundary } = shallowObjectSet(args.wants, args.depth, lookup);
-    const haveReachable = args.haves.length ? collectReachable(args.haves, lookup) : new Set<string>();
+    const haveReachable = args.haves.length ? collectReachableCut(args.haves, cutoffs, lookup) : new Set<string>();
     objectIds = new Set([...objects].filter((oid) => !haveReachable.has(oid)));
     shallow = [...boundary].filter((oid) => objectIds.has(oid) || [...objects].includes(oid));
     // Old boundaries that are now interior (included, not a boundary any more) are unshallow.
     unshallow = args.shallowBoundaries.filter((oid) => objects.has(oid) && !boundary.has(oid));
   } else {
     const wanted = collectReachable(args.wants, lookup);
-    const haveReachable = args.haves.length ? collectReachable(args.haves, lookup) : new Set<string>();
+    const haveReachable = args.haves.length ? collectReachableCut(args.haves, cutoffs, lookup) : new Set<string>();
     objectIds = new Set([...wanted].filter((oid) => !haveReachable.has(oid)));
   }
-  const objects: GitObject[] = [];
+  const objects: { type: GitObjectType; data: Buffer; oid: string }[] = [];
   for (const oid of objectIds) {
     const object = repo.objects.get(oid);
-    if (object) objects.push(object);
+    if (object) objects.push({ type: object.type, data: object.data, oid });
   }
   return { objects, shallow, unshallow };
 }
