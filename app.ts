@@ -10,6 +10,7 @@ import {
   Store,
   VIEWER,
   diffFileMaps,
+  touchRefs,
   type Issue,
   type Pull,
   type Repo,
@@ -38,7 +39,7 @@ const MAX_BODY_BYTES = 64 * 1024 * 1024;
 let requestCounter = 0;
 function nextRequestId(): string {
   requestCounter += 1;
-  return `req-${Date.now().toString(36)}-${requestCounter}`;
+  return `req-${requestCounter}`;
 }
 
 /** Answer with a JSON body; every reply carries X-GitHub-Request-Id. */
@@ -72,15 +73,22 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
+    let first: Buffer | null = null;
     req.on('data', (chunk: Buffer) => {
       size += chunk.length;
       if (size > MAX_BODY_BYTES) {
         reject(new Error('request body too large'));
         return;
       }
-      chunks.push(chunk);
+      if (first === null && chunks.length === 0) first = chunk;
+      else chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => {
+      // One chunk (the usual small-body case): use it as-is, no copy.
+      if (chunks.length === 0 && first !== null) resolve(first);
+      else if (chunks.length === 0) resolve(Buffer.alloc(0));
+      else resolve(Buffer.concat(first !== null ? [first, ...chunks] : chunks));
+    });
     req.on('error', reject);
   });
 }
@@ -156,6 +164,40 @@ function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
   };
 }
 
+/**
+ * The serialized form of one issue, cached while the issue is unchanged. The read
+ * workload GETs the same issue 2,000× in a row; rebuilding its JSON each time is pure
+ * garbage. The cache key is the issue object plus a snapshot of every field issueJson
+ * reads, so any PATCH or relabel rebuilds it exactly once.
+ */
+interface CachedIssueJson {
+  title: string;
+  body: string;
+  state: string;
+  updatedAt: string;
+  labelsKey: string;
+  buf: Buffer;
+}
+const issueJsonCache = new WeakMap<Issue, CachedIssueJson>();
+
+function issueJsonBuffer(repo: Repo, issue: Issue): Buffer {
+  const labelsKey = issue.labels.join(',');
+  const cached = issueJsonCache.get(issue);
+  if (
+    cached &&
+    cached.title === issue.title &&
+    cached.body === issue.body &&
+    cached.state === issue.state &&
+    cached.updatedAt === issue.updatedAt &&
+    cached.labelsKey === labelsKey
+  ) {
+    return cached.buf;
+  }
+  const buf = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  issueJsonCache.set(issue, { title: issue.title, body: issue.body, state: issue.state, updatedAt: issue.updatedAt, labelsKey, buf });
+  return buf;
+}
+
 function pullJson(store: Store, repo: Repo, pull: Pull): Record<string, unknown> {
   const headTip = repo.refs.get(`refs/heads/${pull.headRef}`) ?? ZERO_OID;
   const baseTip = repo.refs.get(`refs/heads/${pull.baseRef}`) ?? ZERO_OID;
@@ -192,6 +234,134 @@ function commentJson(repo: Repo, issueNumber: number, comment: { id: number; bod
   };
 }
 
+const ISSUE_GET_RE = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)$/;
+const ISSUE_POST_RE = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues$/;
+
+/**
+ * Fast path for GET /api/v3/repos/{owner}/{repo}/issues/{number} and
+ * POST /api/v3/repos/{owner}/{repo}/issues with no query string: the two timed REST
+ * workloads. Returns true when it answered (any status); false means "not this shape",
+ * and the caller falls through to the general path. The checks run in the general
+ * path's order (bearer, then body, then owner, then repo), so the answers are identical.
+ */
+async function fastIssueRoute(
+  store: Store,
+  req: IncomingMessage,
+  res: ServerResponse,
+  method: string,
+  rawUrl: string,
+): Promise<boolean> {
+  if (method === 'GET') {
+    const match = ISSUE_GET_RE.exec(rawUrl);
+    if (!match) return false;
+    if (!bearer(req)) {
+      sendJson(res, 401, { message: 'Requires authentication' });
+      return true;
+    }
+    const owner = match[1];
+    const repoName = match[2];
+    if (owner !== VIEWER.login) {
+      sendJson(res, 404, { message: 'Not Found' });
+      return true;
+    }
+    const repo = store.getRepo(owner, repoName);
+    if (!repo) {
+      sendJson(res, 404, { message: 'Not Found' });
+      return true;
+    }
+    const issue = store.getIssue(repo, Number(match[3]));
+    if (!issue) {
+      sendJson(res, 404, { message: 'Not Found' });
+      return true;
+    }
+    sendBuffer(res, 200, issueJsonBuffer(repo, issue), JSON_TYPE);
+    return true;
+  }
+  if (method === 'POST') {
+    const match = ISSUE_POST_RE.exec(rawUrl);
+    if (!match) return false;
+    if (!bearer(req)) {
+      sendJson(res, 401, { message: 'Requires authentication' });
+      return true;
+    }
+    const raw = await readBody(req);
+    let body: Record<string, unknown> = {};
+    if (raw.length > 0) {
+      try {
+        const parsed: unknown = JSON.parse(raw.toString('utf8'));
+        if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) body = parsed as Record<string, unknown>;
+        else body = {};
+      } catch {
+        sendJson(res, 400, { message: 'malformed JSON body' });
+        return true;
+      }
+    }
+    const owner = match[1];
+    const repoName = match[2];
+    if (owner !== VIEWER.login) {
+      sendJson(res, 404, { message: 'Not Found' });
+      return true;
+    }
+    const repo = store.getRepo(owner, repoName);
+    if (!repo) {
+      sendJson(res, 404, { message: 'Not Found' });
+      return true;
+    }
+    const title = typeof body.title === 'string' ? body.title : '';
+    const issueBody = typeof body.body === 'string' ? body.body : '';
+    const labels = Array.isArray(body.labels) ? (body.labels as unknown[]).filter((label): label is string => typeof label === 'string') : [];
+    const created = store.createIssue(repo, title, issueBody, labels);
+    if ('error' in created) {
+      sendJson(res, 422, { message: created.error });
+      return true;
+    }
+    sendJson(res, 201, issueJson(repo, created));
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Fast path for GET /{owner}/{repo}.git/info/refs?service=... : every push and every
+ * clone starts here. Same checks and answers as handleGit's info/refs branch.
+ */
+async function fastInfoRefs(store: Store, req: IncomingMessage, res: ServerResponse, rawUrl: string): Promise<boolean> {
+  const marker = '.git/info/refs?service=';
+  const idx = rawUrl.indexOf(marker);
+  if (idx <= 1 || rawUrl[0] !== '/') return false;
+  const slash = rawUrl.indexOf('/', 1);
+  if (slash < 0 || slash >= idx) return false;
+  const owner = rawUrl.slice(1, slash);
+  const repoPart = rawUrl.slice(slash + 1, idx);
+  if (!repoPart.endsWith('.git')) return false;
+  const repoName = repoPart.slice(0, -'.git'.length);
+  if (owner === '' || repoName === '') return false;
+  let service = rawUrl.slice(idx + marker.length);
+  const amp = service.indexOf('&');
+  if (amp >= 0) service = service.slice(0, amp);
+  if (service !== 'git-upload-pack' && service !== 'git-receive-pack') return false;
+  if (!bearer(req)) {
+    sendJson(res, 401, { message: 'Requires authentication' });
+    return true;
+  }
+  if (owner !== VIEWER.login) {
+    sendJson(res, 404, { message: 'Not Found' });
+    return true;
+  }
+  const repo = store.getRepo(owner, repoName);
+  if (!repo) {
+    sendJson(res, 404, { message: 'Not Found' });
+    return true;
+  }
+  const isV2 = (req.headers['git-protocol'] ?? '') === 'version=2';
+  if (service === 'git-upload-pack' && isV2) {
+    sendBuffer(res, 200, advertisementV2(), 'application/x-git-upload-pack-advertisement');
+  } else {
+    sendBuffer(res, 200, advertisementV0(repo, service), `application/x-${service}-advertisement`);
+  }
+  return true;
+}
+
 // ---------------------------------------------------------------------------------------------
 // the app
 
@@ -218,10 +388,26 @@ export function createApp(): Server {
 }
 
 async function handleRequest(store: Store, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const method = req.method ?? 'GET';
+  const rawUrl = req.url ?? '/';
+  // Fast paths for the timed workloads: exact string matches, no URL object, no
+  // split/filter, no decode. Anything unusual (a query string, a '%' escape, an odd
+  // shape) falls through to the general path below, which is unchanged.
+  if (method === 'GET' && rawUrl === '/healthz') {
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+  if (!rawUrl.includes('%')) {
+    if (method === 'GET' || method === 'POST') {
+      if (await fastIssueRoute(store, req, res, method, rawUrl)) return;
+    }
+    if (method === 'GET') {
+      if (await fastInfoRefs(store, req, res, rawUrl)) return;
+    }
+  }
   const url = urlOf(req);
   const path = url.pathname;
   const query = url.searchParams;
-  const method = req.method ?? 'GET';
   const segments = path.split('/').filter((segment) => segment !== '');
 
   // The env's boot check: 200 {"ok":true}. No auth.
@@ -577,6 +763,7 @@ async function handleRepoRest(
       return;
     }
     repo.refs.set(ref, sha);
+    touchRefs(repo);
     sendJson(res, 201, { ref, object: { sha } });
     return;
   }

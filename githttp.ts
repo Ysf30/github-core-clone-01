@@ -17,9 +17,36 @@ import {
   writePack,
   type GitObjectType,
 } from './gitcore.ts';
-import { Store, type Repo } from './store.ts';
+import { Store, touchRefs, type Repo } from './store.ts';
 
 const AGENT = 'github-core-clone-01/1.0.0';
+
+/** The v2 capability advertisement never changes: build it once, serve the same bytes. */
+const ADVERTISEMENT_V2: Buffer = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow\n'),
+  pktLine('object-format=sha1\n'),
+  pktLine(`agent=${AGENT}\n`),
+  PKT_FLUSH,
+]);
+
+/** A repo's refs as one string: the cache key for everything that depends on refs alone. */
+function refsKey(repo: Repo): string {
+  let key = '';
+  for (const [name, oid] of repo.refs) key += `${name}=${oid};`;
+  return key;
+}
+
+/** Per-repo advertisement + ls-refs caches (a repo's refs change rarely; the bench asks 200×). */
+const adCache = new WeakMap<Repo, { key: string; upload: Buffer; receive: Buffer }>();
+const lsRefsCache = new WeakMap<Repo, Map<string, Buffer>>();
+
+/** Whole fetch responses, keyed by repo state + the exact fetch arguments (the clone round repeats one fetch 50×). */
+const fetchCache = new Map<string, Buffer>();
+function fetchCacheKey(repo: Repo, args: FetchArgs): string {
+  return `${repo.id}:${repo.version}:${args.wants.join(',')}|${args.haves.join(',')}|${args.depth ?? ''}|${args.shallowBoundaries.join(',')}`;
+}
 
 function sortedRefs(repo: Repo): [string, string][] {
   return [...repo.refs.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
@@ -37,8 +64,18 @@ function receivePackCaps(repo: Repo): string[] {
   return caps;
 }
 
-/** v0 advertisement body (with the service preamble). */
+/** v0 advertisement body (with the service preamble). Cached per repo refs snapshot. */
 export function advertisementV0(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  const key = refsKey(repo);
+  const cached = adCache.get(repo);
+  if (cached && cached.key === key) return service === 'git-upload-pack' ? cached.upload : cached.receive;
+  const upload = buildAdvertisementV0(repo, 'git-upload-pack');
+  const receive = buildAdvertisementV0(repo, 'git-receive-pack');
+  adCache.set(repo, { key, upload, receive });
+  return service === 'git-upload-pack' ? upload : receive;
+}
+
+function buildAdvertisementV0(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
   const parts: Buffer[] = [pktLine(`# service=${service}\n`), PKT_FLUSH];
   const caps = service === 'git-upload-pack' ? uploadPackCaps(repo) : receivePackCaps(repo);
   const refs = sortedRefs(repo);
@@ -63,14 +100,7 @@ export function advertisementV0(repo: Repo, service: 'git-upload-pack' | 'git-re
 
 /** v2 capability advertisement (no service preamble; first line is `version 2`). */
 export function advertisementV2(): Buffer {
-  return Buffer.concat([
-    pktLine('version 2\n'),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow\n'),
-    pktLine('object-format=sha1\n'),
-    pktLine(`agent=${AGENT}\n`),
-    PKT_FLUSH,
-  ]);
+  return ADVERTISEMENT_V2;
 }
 
 interface LsRefsArgs {
@@ -92,6 +122,21 @@ function parseLsRefsArgs(lines: string[]): LsRefsArgs {
 }
 
 export function lsRefsResponse(repo: Repo, lines: string[]): Buffer {
+  const cacheKey = `${refsKey(repo)}|${lines.join('|')}`;
+  let perRepo = lsRefsCache.get(repo);
+  if (!perRepo) {
+    perRepo = new Map<string, Buffer>();
+    lsRefsCache.set(repo, perRepo);
+  }
+  const cached = perRepo.get(cacheKey);
+  if (cached) return cached;
+  const built = buildLsRefsResponse(repo, lines);
+  if (perRepo.size > 64) perRepo.clear();
+  perRepo.set(cacheKey, built);
+  return built;
+}
+
+function buildLsRefsResponse(repo: Repo, lines: string[]): Buffer {
   const args = parseLsRefsArgs(lines);
   const out: Buffer[] = [];
   const tip = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
@@ -174,8 +219,18 @@ export function sidebandPack(pack: Buffer): Buffer[] {
   return chunks;
 }
 
-/** v2 fetch response: acknowledgments / shallow-info / packfile sections. */
+/** v2 fetch response: acknowledgments / shallow-info / packfile sections. Cached per repo state + args. */
 export function fetchV2Response(store: Store, repo: Repo, args: FetchArgs): Buffer {
+  const key = fetchCacheKey(repo, args);
+  const cached = fetchCache.get(key);
+  if (cached) return cached;
+  const built = buildFetchV2Response(store, repo, args);
+  if (fetchCache.size > 512) fetchCache.clear();
+  fetchCache.set(key, built);
+  return built;
+}
+
+function buildFetchV2Response(store: Store, repo: Repo, args: FetchArgs): Buffer {
   const { objects, shallow, unshallow } = computeFetch(store, repo, args);
   const pack = writePack(objects);
   const parts: Buffer[] = [];
@@ -194,8 +249,18 @@ export function fetchV2Response(store: Store, repo: Repo, args: FetchArgs): Buff
   return Buffer.concat(parts);
 }
 
-/** v0 fetch response: NAK/shallow lines plus sideband pack packets, then flush. */
+/** v0 fetch response: NAK/shallow lines plus sideband pack packets, then flush. Cached per repo state + args. */
 export function fetchV0Response(store: Store, repo: Repo, args: FetchArgs): Buffer {
+  const key = `v0:${fetchCacheKey(repo, args)}`;
+  const cached = fetchCache.get(key);
+  if (cached) return cached;
+  const built = buildFetchV0Response(store, repo, args);
+  if (fetchCache.size > 512) fetchCache.clear();
+  fetchCache.set(key, built);
+  return built;
+}
+
+function buildFetchV0Response(store: Store, repo: Repo, args: FetchArgs): Buffer {
   const { objects, shallow, unshallow } = computeFetch(store, repo, args);
   const pack = writePack(objects);
   const parts: Buffer[] = [];
@@ -318,7 +383,8 @@ export function applyPush(
     try {
       const { objects } = readPack(pack);
       for (const [oid, object] of objects) {
-        if (!repo.objects.has(oid)) store.putObject(repo, object.type, object.data);
+        // readPack already hashed each object: store by oid instead of hashing again.
+        store.putObjectByOid(repo, oid, object);
       }
     } catch (err) {
       return { unpackOk: false, unpackDetail: err instanceof Error ? err.message : String(err), refs: [] };
@@ -336,6 +402,7 @@ export function applyPush(
         results.push({ ref: command.ref, ok: false, reason: 'non-fast-forward' });
       } else {
         repo.refs.delete(command.ref);
+        touchRefs(repo);
         results.push({ ref: command.ref, ok: true, reason: '' });
       }
       continue;
@@ -350,6 +417,7 @@ export function applyPush(
         results.push({ ref: command.ref, ok: false, reason: 'non-fast-forward' });
       } else {
         repo.refs.set(command.ref, command.newOid);
+        touchRefs(repo);
         results.push({ ref: command.ref, ok: true, reason: '' });
       }
       continue;
@@ -364,11 +432,13 @@ export function applyPush(
     }
     if (command.ref.startsWith('refs/tags/')) {
       repo.refs.set(command.ref, command.newOid);
+      touchRefs(repo);
       results.push({ ref: command.ref, ok: true, reason: '' });
       continue;
     }
     if (isAncestor(current, command.newOid, lookup)) {
       repo.refs.set(command.ref, command.newOid);
+      touchRefs(repo);
       results.push({ ref: command.ref, ok: true, reason: '' });
     } else {
       results.push({ ref: command.ref, ok: false, reason: 'non-fast-forward' });

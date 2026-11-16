@@ -23,6 +23,11 @@ export const VIEWER = {
 
 export const VIEWER_IDENTITY = `${VIEWER.name} <${VIEWER.email}>`;
 
+/** Mark a repo's refs changed (bumps the version the git layer's response caches key off). */
+export function touchRefs(repo: Repo): void {
+  repo.version += 1;
+}
+
 export interface Issue {
   id: number;
   number: number;
@@ -71,6 +76,8 @@ export interface Repo {
   defaultBranch: string;
   createdSeq: number;
   createdAt: string;
+  /** Bumped on every object or ref change; the git layer's response caches key off it. */
+  version: number;
   refs: Map<string, string>;
   objects: Map<string, GitObject>;
   commitSeq: Map<string, number>;
@@ -152,6 +159,7 @@ export class Store {
       defaultBranch: 'main',
       createdSeq: this.createdCounter,
       createdAt: nowIso(),
+      version: 0,
       refs: new Map(),
       objects: new Map(),
       commitSeq: new Map(),
@@ -190,10 +198,16 @@ export class Store {
 
   putObject(repo: Repo, type: GitObjectType, data: Buffer): string {
     const oid = hashObject(type, data);
+    return this.putObjectByOid(repo, oid, { type, data });
+  }
+
+  /** Store an object whose id is already known (a pack reader computed it): skips a second SHA-1. */
+  putObjectByOid(repo: Repo, oid: string, object: GitObject): string {
     if (!repo.objects.has(oid)) {
-      repo.objects.set(oid, { type, data });
-      if (type === 'commit') repo.commitSeq.set(oid, this.seq);
+      repo.objects.set(oid, object);
+      if (object.type === 'commit') repo.commitSeq.set(oid, this.seq);
       this.seq += 1;
+      repo.version += 1;
     }
     return oid;
   }
@@ -325,6 +339,7 @@ export class Store {
     const parents = tip ? [tip] : [];
     const commitSha = this.makeCommit(repo, tree, parents, message);
     repo.refs.set(ref, commitSha);
+    touchRefs(repo);
     return { commitSha, contentSha: blobOid, created };
   }
 
@@ -390,6 +405,7 @@ export class Store {
     const tree = this.buildTreeFromFiles(repo, files);
     const commitSha = this.makeCommit(repo, tree, [tip], message);
     repo.refs.set(ref, commitSha);
+    touchRefs(repo);
     return commitSha;
   }
 
@@ -408,6 +424,7 @@ export class Store {
     for (const label of labels) {
       if (!repo.labels.has(label)) return { error: `label ${label} does not exist` };
     }
+    const now = nowIso();
     const issue: Issue = {
       id: this.nextIssueId,
       number: repo.nextIssueNumber,
@@ -416,8 +433,8 @@ export class Store {
       state: 'open',
       labels: [...labels],
       createdSeq: this.seq,
-      createdAt: nowIso(),
-      updatedAt: nowIso(),
+      createdAt: now,
+      updatedAt: now,
     };
     this.nextIssueId += 1;
     this.seq += 1;
@@ -558,6 +575,7 @@ export class Store {
     const message = `Merge pull request #${pull.number} from ${repo.owner}/${pull.headRef}`;
     const mergeSha = this.makeCommit(repo, tree, [baseTip], message);
     repo.refs.set(`refs/heads/${pull.baseRef}`, mergeSha);
+    touchRefs(repo);
     pull.merged = true;
     pull.state = 'closed';
     pull.mergedAt = nowIso();

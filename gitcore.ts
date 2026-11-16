@@ -262,26 +262,36 @@ export function writePack(objects: readonly { type: GitObjectType; data: Buffer;
 /**
  * Inflate the zlib stream starting at `offset` and return its data plus the number of
  * compressed bytes it consumed. Node's inflateSync ignores trailing garbage, so the stream
- * end is found by re-deflating: zlib is deterministic, so a default-options re-deflate of
- * the inflated data reproduces the exact stream bytes when the sender used the defaults
- * (as this suite's client does). A byte-equality check guards the fast path; anything else
+ * end is found from the inflate engine itself: with `{ info: true }` the engine reports
+ * `bytesWritten`, the exact number of input bytes the stream consumed (verified equal to a
+ * re-deflate of the inflated data on this suite's packs). A re-deflate check guards the
+ * fast path when the engine does not report a usable length (older Node); anything else
  * falls back to a binary search over the stream end (truncated streams throw).
  */
 function inflateAt(pack: Buffer, offset: number, expectedSize?: number): { data: Buffer; consumed: number } {
-  const data = inflateSync(pack.subarray(offset));
+  const input = pack.subarray(offset);
+  const result = inflateSync(input, { info: true }) as unknown as {
+    buffer: Buffer;
+    engine?: { bytesWritten?: unknown };
+  };
+  const data = result.buffer;
   if (expectedSize !== undefined && data.length !== expectedSize) {
     throw new Error(`inflated size ${data.length}, expected ${expectedSize}`);
   }
+  const written = result.engine?.bytesWritten;
+  if (typeof written === 'number' && Number.isInteger(written) && written > 0 && written <= input.length) {
+    return { data, consumed: written };
+  }
   const recompressed = deflateSync(data);
-  if (recompressed.length <= pack.length - offset && pack.subarray(offset, offset + recompressed.length).equals(recompressed)) {
+  if (recompressed.length <= input.length && input.subarray(0, recompressed.length).equals(recompressed)) {
     return { data, consumed: recompressed.length };
   }
   let lo = 1;
-  let hi = pack.length - offset;
+  let hi = input.length;
   while (lo < hi) {
     const mid = (lo + hi) >> 1;
     try {
-      const trial = inflateSync(pack.subarray(offset, offset + mid));
+      const trial = inflateSync(input.subarray(0, mid));
       if (expectedSize !== undefined && trial.length !== expectedSize) throw new Error('short');
       hi = mid;
     } catch {
