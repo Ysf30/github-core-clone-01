@@ -1,7 +1,12 @@
 // The forge's HTTP surface: git smart HTTP, REST v3, GraphQL v4, MCP. Stdlib only.
 // main.ts owns the env lifecycle; this file is the server.
+// The HTTP transport is transport.ts (raw TCP HTTP/1.1, a drop-in for
+// node:http's createServer): the timed workloads are transport-bound, and the
+// minimal parser cuts the per-request server cost. The handler below is
+// unchanged by the transport swap.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer } from './transport.ts';
 import {
   ZERO_OID,
   decodePktLines,
